@@ -525,8 +525,13 @@ async def _download_chunk(
 
 async def _warm_download_url(url: str, page_url: str) -> Tuple[str, dict]:
     """
-    Use cloudscraper to GET the download URL, solve any Cloudflare challenge,
+    Use cloudscraper to PROBE the download URL, solve any Cloudflare challenge,
     follow redirects, and return (final_url, cookies_dict) for aiohttp to use.
+
+    Key implementation detail: we send a single-byte Range request so the
+    server only sends 1 byte of body back. That keeps the warmup sub-second
+    even on 2 GB files. We do NOT want `stream=False` here — that would
+    pull the full body into memory just for cookies.
 
     The CDN often requires:
       - Cloudflare clearance cookies (__cf_bm, cf_clearance) — solved by cloudscraper
@@ -544,14 +549,33 @@ async def _warm_download_url(url: str, page_url: str) -> Tuple[str, dict]:
             "Origin": "https://www.freepornvideos.xxx",
         })
         try:
+            # 1) Try HEAD first — fastest path, no body at all
+            try:
+                resp = scraper.request(
+                    "HEAD", url, timeout=10, allow_redirects=True,
+                )
+                return str(resp.url), dict(scraper.cookies.get_dict())
+            except Exception:
+                pass  # fall through to range probe
+
+            # 2) Range probe — downloads exactly 1 byte, sets cookies
             resp = scraper.get(
                 url,
-                timeout=30,
+                timeout=10,
                 allow_redirects=True,
-                stream=False,  # we just want headers + cookies, not the body
+                headers={"Range": "bytes=0-0"},
+                stream=True,
             )
-            cookies = dict(scraper.cookies.get_dict())
-            return str(resp.url), cookies
+            try:
+                # Consume the (tiny) body so the connection closes cleanly
+                for _ in resp.iter_content(chunk_size=1):
+                    break
+                return str(resp.url), dict(scraper.cookies.get_dict())
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
         except Exception as e:
             log.warning("cloudscraper warmup failed for %s: %s", url, e)
             return url, {}
