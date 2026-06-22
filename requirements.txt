@@ -8,7 +8,8 @@ pyrogram==2.0.106
 tgcrypto==1.2.5
 
 # Async HTTP client (used for downloads + the health server)
-aiohttp==3.9.5
+# [speedups] pulls in aiodns (faster DNS) and brotli (faster compression)
+aiohttp[speedups]==3.9.5
 
 # HTML parser
 beautifulsoup4==4.12.3
