@@ -1,0 +1,25 @@
+# Render reads `PYTHON_VERSION` from env vars (set in render.yaml) as the
+# primary Python selector. The `pyproject.toml` here is a backup using the
+# Poetry schema, which Render's build runner (Poetry 2.1.3) also recognizes.
+#
+# Why pin to 3.11.x:
+#   - Pyrogram 2.0.106 calls asyncio.get_event_loop() at import time. That
+#     function was deprecated in 3.10, warned in 3.12, and raises
+#     RuntimeError in 3.14 when no loop is bound to MainThread. Boom.
+#   - tgcrypto 1.2.5 / aiohttp 3.9.5 / lxml 5.2.2 all ship prebuilt wheels
+#     for cpython 3.11 linux-x86_64 — fast build, no source compilation.
+#
+# Order of precedence on Render (verified):
+#   1. $PYTHON_VERSION env var   <-- we set this in render.yaml
+#   2. runtime.txt              (deprecated; ignored on newer images)
+#   3. pyproject.toml [tool.poetry.dependencies].python
+#   4. default (3.14.3 in 2026)
+
+[tool.poetry]
+name = "telegram-video-bot"
+version = "0.1.0"
+description = "Telegram video downloader bot on Render free tier"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
