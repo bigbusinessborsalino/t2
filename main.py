@@ -98,9 +98,9 @@ DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", str(_DEFAULT_TMP)))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 VIDEOS_PER_PAGE = 8
-MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "2"))
-DL_WORKERS = 8
-CHUNK_SIZE = 256 * 1024
+MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "4"))
+DL_WORKERS = int(os.environ.get("DL_WORKERS", "16"))
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(1024 * 1024)))  # 1 MB
 PROGRESS_UPDATE_SEC = 2.0
 SITE_BASE = "https://www.freepornvideos.xxx"
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
@@ -1124,7 +1124,24 @@ async def start_download(message: Message, video_id: str, entry_index: int) -> N
         log.info("got %d cookies from warmup: %s", len(cookies), list(cookies.keys()))
 
     async with dl_sem:
-        async with aiohttp.ClientSession(cookies=cookies or None) as session:
+        # High-performance connector: big connection pool, no per-host cap,
+        # DNS cache enabled, TCP keepalive on so we don't pay handshake cost
+        # on every chunk of a parallel range download.
+        connector = aiohttp.TCPConnector(
+            limit=0,                     # no global cap
+            limit_per_host=0,            # no per-host cap
+            ttl_dns_cache=300,           # cache DNS for 5 min
+            use_dns_cache=True,
+            keepalive_timeout=75,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=120)
+        async with aiohttp.ClientSession(
+            cookies=cookies or None,
+            connector=connector,
+            timeout=timeout,
+            headers=_DL_HEADERS,
+        ) as session:
             progress = ProgressTracker(status, label="Downloading")
             try:
                 size = await download_to_file(
@@ -1183,20 +1200,32 @@ async def start_download(message: Message, video_id: str, entry_index: int) -> N
 
 
 class UploadProgress:
+    """
+    Pyrogram's `progress` callback is invoked SYNCHRONOUSLY from the upload
+    worker thread. If we make __call__ async, Pyrogram gets a coroutine
+    back, throws it away (uncaught warning), and the user never sees the
+    progress bar update. So __call__ is sync, and we hop back to the
+    event loop with run_coroutine_threadsafe to actually edit the message.
+    """
+
     def __init__(self, message: Message, fname: str, total: int) -> None:
         self.message = message
         self.fname = fname
         self.total = total
         self.start = time.time()
         self.last_edit = 0.0
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
-    async def __call__(self, current: int, total: int) -> None:
+    def __call__(self, current: int, total: int) -> None:
         now = time.time()
         if now - self.last_edit < PROGRESS_UPDATE_SEC:
             return
         self.last_edit = now
         elapsed = max(now - self.start, 0.001)
-        speed = current / elapsed
+        speed = current / elapsed if elapsed > 0 else 0
         if total and total > 0:
             pct = current / total * 100
             bar = _bar(pct)
@@ -1208,6 +1237,22 @@ class UploadProgress:
             )
         else:
             text = f"📤 Uploading\n{_fmt(current)} sent\nSpeed: {_fmt(speed)}/s"
+        # Hop to the bot's event loop to edit the message
+        if self._loop and self._loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._safe_edit(text), self._loop
+                )
+                return
+            except Exception:
+                pass
+        # Last-ditch: try a direct edit anyway
+        try:
+            self._loop.create_task(self._safe_edit(text)) if self._loop else None
+        except Exception:
+            pass
+
+    async def _safe_edit(self, text: str) -> None:
         try:
             await self.message.edit_text(text)
         except Exception:
