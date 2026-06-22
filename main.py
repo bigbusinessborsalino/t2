@@ -474,14 +474,26 @@ def _fmt(n: float) -> str:
 
 
 _DL_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "video",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
+    "Origin": "https://www.freepornvideos.xxx",
 }
 _DL_TIMEOUT = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
 
 
-async def _probe(session: aiohttp.ClientSession, url: str) -> Tuple[Optional[int], bool]:
+async def _probe(
+    session: aiohttp.ClientSession,
+    url: str,
+    headers: Optional[dict] = None,
+) -> Tuple[Optional[int], bool]:
+    hdrs = {**_DL_HEADERS, **(headers or {})}
     try:
-        async with session.head(url, headers=_DL_HEADERS, timeout=_DL_TIMEOUT, allow_redirects=True) as r:
+        async with session.head(url, headers=hdrs, timeout=_DL_TIMEOUT, allow_redirects=True) as r:
             cl = r.headers.get("Content-Length")
             total = int(cl) if cl and cl.isdigit() else None
             ranges = r.headers.get("Accept-Ranges", "").lower() == "bytes"
@@ -497,9 +509,10 @@ async def _download_chunk(
     offset: int,
     length: int,
     counter: "list[int]",
+    headers: Optional[dict] = None,
 ) -> None:
     end = offset + length - 1
-    hdrs = {**_DL_HEADERS, "Range": f"bytes={offset}-{end}"}
+    hdrs = {**_DL_HEADERS, **(headers or {}), "Range": f"bytes={offset}-{end}"}
     async with session.get(url, headers=hdrs, timeout=_DL_TIMEOUT, allow_redirects=True) as r:
         r.raise_for_status()
         with dest.open("r+b") as f:
@@ -510,13 +523,52 @@ async def _download_chunk(
                     counter[0] += len(chunk)
 
 
+async def _warm_download_url(url: str, page_url: str) -> Tuple[str, dict]:
+    """
+    Use cloudscraper to GET the download URL, solve any Cloudflare challenge,
+    follow redirects, and return (final_url, cookies_dict) for aiohttp to use.
+
+    The CDN often requires:
+      - Cloudflare clearance cookies (__cf_bm, cf_clearance) — solved by cloudscraper
+      - A proper Referer header pointing to the page that linked the file
+      - A matching User-Agent (we use the same one as _DL_HEADERS)
+    """
+    def _do() -> Tuple[str, dict]:
+        scraper = _get_scraper()
+        # Force the same UA so the cookies match what aiohttp will send
+        scraper.headers.update({
+            "User-Agent": _DL_HEADERS["User-Agent"],
+            "Accept": _DL_HEADERS["Accept"],
+            "Accept-Language": _DL_HEADERS["Accept-Language"],
+            "Referer": page_url or "https://www.freepornvideos.xxx/",
+            "Origin": "https://www.freepornvideos.xxx",
+        })
+        try:
+            resp = scraper.get(
+                url,
+                timeout=30,
+                allow_redirects=True,
+                stream=False,  # we just want headers + cookies, not the body
+            )
+            cookies = dict(scraper.cookies.get_dict())
+            return str(resp.url), cookies
+        except Exception as e:
+            log.warning("cloudscraper warmup failed for %s: %s", url, e)
+            return url, {}
+
+    return await asyncio.to_thread(_do)
+
+
 async def download_to_file(
     session: aiohttp.ClientSession,
     url: str,
     dest: Path,
     progress: Optional[ProgressTracker] = None,
+    referer: str = "",
 ) -> int:
-    total, accepts_ranges = await _probe(session, url)
+    dl_headers: dict = {"Referer": referer or "https://www.freepornvideos.xxx/"}
+
+    total, accepts_ranges = await _probe(session, url, headers=dl_headers)
 
     if accepts_ranges and total and total > 2 * 1024 * 1024:
         workers = min(DL_WORKERS, max(1, total // (2 * 1024 * 1024)))
@@ -539,7 +591,7 @@ async def download_to_file(
             for i in range(workers):
                 off = i * chunk_sz
                 ln = chunk_sz if i < workers - 1 else total - off
-                tasks.append(_download_chunk(session, url, dest, off, ln, counter))
+                tasks.append(_download_chunk(session, url, dest, off, ln, counter, dl_headers))
             await asyncio.gather(*tasks)
         finally:
             ticker.cancel()
@@ -547,7 +599,7 @@ async def download_to_file(
             await progress.update(total, total)
         return total
 
-    async with session.get(url, headers=_DL_HEADERS, timeout=_DL_TIMEOUT, allow_redirects=True) as r:
+    async with session.get(url, headers={**_DL_HEADERS, **dl_headers}, timeout=_DL_TIMEOUT, allow_redirects=True) as r:
         r.raise_for_status()
         total_hdr = r.headers.get("Content-Length")
         total = int(total_hdr) if total_hdr and total_hdr.isdigit() else None
@@ -1026,13 +1078,43 @@ async def start_download(message: Message, video_id: str, entry_index: int) -> N
         f"⏬ Starting download…\n🎬 {rec.title}\n📄 {fname}"
     )
 
+    # --- Cloudflare / CDN warmup ----------------------------------------
+    # The CDN behind these files often requires:
+    #   1. Cloudflare clearance cookies (solved by cloudscraper)
+    #   2. A proper Referer header (we use the page that linked the file)
+    #   3. A matching User-Agent (cloudscraper uses ours)
+    # We do one GET through cloudscraper to solve the challenge, harvest
+    # cookies + final URL, then hand them to aiohttp for the actual transfer.
+    status = await message.edit_text(
+        f"⏬ Starting download…\n🎬 {rec.title}\n📄 {fname}\n🔐 Solving CDN challenge…"
+    )
+    try:
+        final_url, cookies = await _warm_download_url(url, rec.page_url)
+    except Exception as e:
+        log.warning("warmup exception: %s", e)
+        final_url, cookies = url, {}
+
+    if final_url != url:
+        log.info("redirect resolved: %s -> %s", url, final_url)
+    if cookies:
+        log.info("got %d cookies from warmup: %s", len(cookies), list(cookies.keys()))
+
     async with dl_sem:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(cookies=cookies or None) as session:
             progress = ProgressTracker(status, label="Downloading")
             try:
-                size = await download_to_file(session, url, dest, progress=progress)
+                size = await download_to_file(
+                    session, final_url, dest,
+                    progress=progress,
+                    referer=rec.page_url,
+                )
             except aiohttp.ClientResponseError as e:
-                await status.edit_text(f"❌ HTTP {e.status} during download.")
+                # 403/503 from the CDN — log so we can debug, then surface to user
+                log.warning("download %s: HTTP %s", final_url, e.status)
+                await status.edit_text(
+                    f"❌ HTTP {e.status} from CDN.\n"
+                    f"Try `/refresh` and pick a different quality — the source may be cold."
+                )
                 return
             except Exception as e:
                 await status.edit_text(f"❌ Download failed: `{e}`")
