@@ -1,0 +1,38 @@
+# Render Infrastructure as Code
+# Deploy: render blueprint launch (or use the Render Dashboard "New → Blueprint")
+#
+# After this deploys:
+#   1. Set env vars API_ID, API_HASH, BOT_TOKEN in the Render dashboard
+#      (or via `render env set`).
+#   2. Point UptimeRobot at https://<service>.onrender.com/health every 5 min.
+
+services:
+  - type: web
+    name: telegram-video-bot
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PIP_DISABLE_PIP_VERSION_CHECK
+        value: "1"
+      - key: MAX_PARALLEL
+        value: "2"
+      - key: USER_COOLDOWN_SEC
+        value: "1.5"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false

@@ -1,0 +1,21 @@
+# Render Free Tier — Telegram Video Downloader Bot
+# Pin major versions for reproducible deploys.
+
+# Pyrogram (Telegram MTProto client)
+pyrogram==2.0.106
+
+# Faster MTProto AES — optional but recommended
+tgcrypto==1.2.5
+
+# Async HTTP client (used for downloads + the health server)
+aiohttp==3.9.5
+
+# HTML parser
+beautifulsoup4==4.12.3
+lxml==5.2.2
+
+# Cloudflare-aware HTTP fetcher (sync, called via asyncio.to_thread)
+cloudscraper==1.2.71
+
+# Standard requests — cloudscraper is built on it; pinned for safety
+requests==2.32.3
